@@ -9,22 +9,26 @@ https://meta.discourse.org/t/using-discourse-as-a-sso-provider/32974
 # Based off paxmanchris example:
 https://gist.github.com/paxmanchris/e93018a3e8fbdfced039
 */
-define('SSO_DB_HOST', 'localhost');
-define('SSO_DB_USERNAME', '');
-define('SSO_DB_PASSWORD', '');
-define('SSO_DB_SCHEMA', '');
+
+define('DB_SERVER', "localhost");
+define('DB_NAME', "");
+define('DB_USER', "");
+define('DB_PASSWORD', "");
+define('DB_PORT', "5432");
+define('DB_MWSCHEMA', "mediawiki");
+
 define('SSO_DB_TABLE', 'sso_login');
 
 define('SSO_URL_LOGGED', 'https://'.$_SERVER['HTTP_HOST']);
 define('SSO_URL_SCRIPT', 'https://'.$_SERVER['HTTP_HOST'].$_SERVER['SCRIPT_NAME']);
-define('SSO_URL_DISCOURSE', 'https://example.com');
+define('SSO_URL_DISCOURSE', '<CHANGE_ME>');
 // "sso secret" from Discourse admin panel
 // Good way to generate one on Linux: pwgen -syc
 define('SSO_SECRET', '<CHANGE_ME>');
 // Another secret used for sign local cookie
 define('SSO_LOCAL_SECRET', '<CHANGE_ME>');
 // Seconds before new nonce expire
-define('SSO_TIMEOUT', 60);
+define('SSO_TIMEOUT', 120);
 // Seconds before SSO authentication expire
 define('SSO_EXPIRE', 2592000);
 define('SSO_COOKIE', '__discourse_sso');
@@ -39,7 +43,19 @@ if(basename(__FILE__) === basename($_SERVER['SCRIPT_NAME']))
 	$status = $DISCOURSE_SSO->getAuthentication();
 	if(false !== $status && true == $status['logged'])
 	{
-		header('Location: '.URL_LOGGEDREDIRECT);
+        if(isset($_GET['logout'])){
+
+            $hashedNonce = hash('sha512', $status["nonce"]);
+
+            if($hashedNonce === $_GET['logout']){
+                $DISCOURSE_SSO->logoutUser($status["nonce"]);
+            } else {
+                die("invalid logout request");
+            }
+            
+        } else {
+            header('Location: ' . SSO_URL_LOGGED);
+        }
 	}
 	else if(empty($_GET) || !isset($_GET['sso']) || !isset($_GET['sig']))
 	{
@@ -53,31 +69,42 @@ if(basename(__FILE__) === basename($_SERVER['SCRIPT_NAME']))
 
 class DiscourseSSOClient
 {
-	private $mysqli;
-	private $sqlStructure = 'CREATE TABLE IF NOT EXISTS `%s` (
-		`id` int(11) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-		`nonce` text NOT NULL,
-		`logged` Tinyint(1) NOT NULL,
-		`name` text,
-		`username` text,
-		`email` text,
-		`admin` Tinyint(1) NOT NULL,
-		`moderator` Tinyint(1) NOT NULL,
-		`expire` int(11) NOT NULL
-	)';
+	private $db;
+	private $sqlStructure = 'CREATE TABLE IF NOT EXISTS %s (
+    id BIGSERIAL PRIMARY KEY,
+    nonce TEXT NOT NULL,
+    logged SMALLINT NOT NULL,
+    name TEXT,
+    username TEXT,
+    email TEXT,
+    admin SMALLINT NOT NULL DEFAULT 0,
+    moderator SMALLINT NOT NULL DEFAULT 0,
+    expire INTEGER NOT NULL
+);';
 
 	public function __construct($createTableIfNotExist = false)
 	{
-		$this->mysqli = new mysqli(SSO_DB_HOST, SSO_DB_USERNAME, SSO_DB_PASSWORD, SSO_DB_SCHEMA);
-		if(mysqli_connect_errno())
-		{
-			exit('Discourse SSO: could not connect to MySQL database!');
-		}
+		$this->db = pg_connect("host = ". DB_SERVER . " port = " . DB_PORT . " dbname = " . DB_NAME . " " .
+                               "user = " . DB_USER . " password=" . DB_PASSWORD);
+        if(!$this->db){
+            die("failed to connect to db");
+            return;
+        }
+
+        pg_query($this->db, "SET search_path TO " . DB_MWSCHEMA);
+        
 		if($createTableIfNotExist)
 			$this->createTableIfNotExist();
 		if(rand(0, 10) === 50)
 			$this->removeExpiredNonces();
 	}
+
+	public function __destruct()
+    {
+        if($this->db){
+            pg_close($this->db);
+        }
+    }
 
 	public function getAuthentication()
 	{
@@ -140,21 +167,30 @@ class DiscourseSSOClient
 		header('Location: '.SSO_URL_LOGGED);
 	}
 
+    public function logoutUser($nonce)
+    {
+        $this->removeNonce($nonce);
+        $this->unSetCookie();
+        header('Location: ' . SSO_URL_LOGGED);
+    }
+
 	public function removeNonce($nonce)
 	{
-		$nonce = $this->mysqli->escape_string($nonce);
-		$this->mysqli->query('DELETE FROM '.SSO_DB_TABLE.' WHERE nonce = "'.$nonce.'"');
+        $nonce = pg_escape_string($this->db, $nonce);
+        pg_query($this->db, 'DELETE FROM '.SSO_DB_TABLE." WHERE nonce = '" . $nonce . "';");
 	}
 
 	private function removeExpiredNonces()
 	{
-		$this->mysqli->query('DELETE FROM '.SSO_DB_TABLE.' WHERE expire < UNIX_TIMESTAMP()');
+        pg_query($this->db, 'DELETE FROM '.SSO_DB_TABLE.
+                 ' WHERE expire < extract(epoch from now());');
 	}
 
 	private function addNonce($nonce, $expire)
 	{
-		$nonce = $this->mysqli->escape_string($nonce);
-		$this->mysqli->query("INSERT INTO ".SSO_DB_TABLE." (`id`, `nonce`, `logged`, `expire`) VALUES (NULL, '$nonce', '0', '".$expire."');");
+        $nonce = pg_escape_string($this->db, $nonce);
+        pg_query($this->db, 'INSERT INTO '.SSO_DB_TABLE.
+                 " (nonce, logged, expire) VALUES ('" . $nonce . "', 0, " . $expire . ");");
 	}
 
 	private function getStatus($nonce)
@@ -170,20 +206,19 @@ class DiscourseSSOClient
 				'moderator'	=> false
 			)
 		);
-		$nonce = $this->mysqli->escape_string($nonce);
-		if($result = $this->mysqli->query("SELECT * FROM ".SSO_DB_TABLE." WHERE `nonce`='$nonce' AND `expire` > UNIX_TIMESTAMP()"))
+        $nonce = pg_escape_string($this->db, $nonce);
+		if($result = pg_query($this->db, "SELECT logged, name, username, email, admin, moderator FROM ".SSO_DB_TABLE.
+                              " WHERE nonce='$nonce' AND expire  > extract(epoch from now());"))
 		{
-			if($result->num_rows === 1)
-			{
-				$row = $result->fetch_assoc();
-				$return['logged'] = intval($row['logged']) == 1;
-				$return['data']['name'] = $row['name'];
-				$return['data']['username'] = $row['username'];
-				$return['data']['email'] = $row['email'];
-				$return['data']['admin'] = intval($row['admin']) == 1;
-				$return['data']['moderator'] = intval($row['admin']) == 1;
+            while($row = pg_fetch_row($result)) {
+				$return['logged'] = intval($row[0]) == 1;
+				$return['data']['name'] = $row[1];
+				$return['data']['username'] = $row[2];
+				$return['data']['email'] = $row[3];
+				$return['data']['admin'] = intval($row[4]) == 1;
+				$return['data']['moderator'] = intval($row[5]) == 1;
+                return $return;                
 			}
-			return $return;
 		}
 		return false;
 	}
@@ -192,22 +227,28 @@ class DiscourseSSOClient
 	{
 		$isAdmin = $data['admin'] === 'true' ? '1' : '0';
 		$isModerator = $data['moderator'] === 'true' ? '1' : '0';
-		$this->mysqli->query("UPDATE `".SSO_DB_TABLE."`
+
+        pg_query($this->db, "UPDATE ".SSO_DB_TABLE."
 			SET
-				`logged` = 1,
-				`expire` = ".$expire.",
-				`name` = '".$this->mysqli->escape_string($data['name'])."',
-				`username` = '".$this->mysqli->escape_string($data['username'])."',
-				`email` = '".$this->mysqli->escape_string($data['email'])."',
-				`admin` = '".$isAdmin."',
-				`moderator` = '".$isModerator."'
-			WHERE `nonce` = '".$this->mysqli->escape_string($data['nonce'])."'");
+				logged = 1,
+				expire = ".$expire.",
+				name = '".pg_escape_string($this->db, $data['name'])."',
+				username = '".pg_escape_string($this->db, $data['username'])."',
+				email = '".pg_escape_string($this->db, $data['email'])."',
+				admin = '".$isAdmin."',
+				moderator = '".$isModerator."'
+			WHERE nonce = '".pg_escape_string($this->db, $data['nonce'])."'");        
 	}
 
 	private function setCookie($value, $expire)
 	{
 		setcookie(SSO_COOKIE, $value.','.$this->signCookie($value), $expire, "/", SSO_COOKIE_DOMAIN, SSO_COOKIE_SECURE, SSO_COOKIE_HTTPONLY);
 	}
+
+    private function unSetCookie()
+    {
+		setcookie(SSO_COOKIE, '', time() - 3600, "/", SSO_COOKIE_DOMAIN, SSO_COOKIE_SECURE, SSO_COOKIE_HTTPONLY);
+    }
 
 	private function getUrl($request)
 	{
@@ -226,17 +267,29 @@ class DiscourseSSOClient
 
 	private function createTableIfNotExist()
 	{
-		if($result = $this->mysqli->query(sprintf("SHOW TABLES LIKE '%s'", SSO_DB_TABLE)))
+        $ret = pg_query($this->db, "SELECT EXISTS (SELECT 1 FROM information_schema.tables ".
+                        "WHERE table_schema = '". DB_MWSCHEMA ."' AND table_name = '".
+                        SSO_DB_TABLE."');");
+
+        $exists = false;
+
+        if($ret){
+            while($row = pg_fetch_row($ret)) {
+                if($row[0] == 't'){
+                    $exists = true;
+                }
+                break;
+            }
+        }
+        
+		if($exists != true)
 		{
-			if($result->num_rows != 1)
-			{
-				$this->mysqli->query(sprintf($this->sqlStructure, SSO_DB_TABLE));
-			}
+            pg_query($this->db, sprintf($this->sqlStructure, SSO_DB_TABLE));
 		}
 	}
 
 	public function dropTable()
 	{
-		$this->mysqli->query("DROP TABLE IF EXISTS ".SSO_DB_TABLE);
+		pg_query($this->db, "DROP TABLE IF EXISTS ".SSO_DB_TABLE);
 	}
 }
